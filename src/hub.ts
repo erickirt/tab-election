@@ -1,6 +1,19 @@
 import { Tab } from './tab.js';
 
 /**
+ * `instanceof SharedWorker` THROWS when the global is undefined (Samsung
+ * Internet has no SharedWorker; neither do some worker/test contexts), so all
+ * worker-kind checks go through these typeof-guarded helpers.
+ */
+function isSharedWorker(worker: unknown): worker is SharedWorker {
+  return typeof SharedWorker !== 'undefined' && worker instanceof SharedWorker;
+}
+
+function isDedicatedWorker(worker: unknown): worker is Worker {
+  return typeof Worker !== 'undefined' && worker instanceof Worker;
+}
+
+/**
  * Hub & Spoke Multi-Tab Coordination Utility
  *
  * This utility provides a simple way to coordinate multiple browser tabs using a hub-and-spoke
@@ -166,6 +179,16 @@ export interface SpokeOptions {
   version?: string;
   /** Whether to use SharedWorker when available */
   useSharedWorker?: boolean;
+  /** How long a service call waits for a return before rejecting with `Error('Call timed out')`. Default 30s. */
+  callTimeout?: number;
+}
+
+/** Why a spoke recovered its hub worker. */
+export type RecoveryReason = 'heartbeat' | 'call-stall';
+
+export interface RecoveryEvent {
+  reason: RecoveryReason;
+  attempt: number;
 }
 
 /**
@@ -467,6 +490,8 @@ export class Spoke {
   protected _recoveryAttempt = 0;
   protected _heartbeatTimeout?: ReturnType<typeof setTimeout>;
   protected _lastHeartbeat = 0;
+  protected _consecutiveCallTimeouts = 0;
+  protected onRecoveryListeners = new Set<EventListener<RecoveryEvent>>();
 
   readonly name: string;
   readonly version?: string;
@@ -487,7 +512,7 @@ export class Spoke {
   constructor(options: SpokeOptions) {
     this.name = options.name || 'default';
     this.version = options.version || '0.0.0';
-    this.tab = new Tab(`hub/${this.name}/${this.version}`);
+    this.tab = new Tab(`hub/${this.name}/${this.version}`, { callTimeout: options.callTimeout });
     this.tab.addEventListener('state', event => {
       this.onStateListeners.forEach(listener => listener(event.data));
     });
@@ -511,7 +536,7 @@ export class Spoke {
 
     // Listen for leadership changes from the worker (regular Worker via postMessage,
     // in-tab Hub via EventTarget). SharedWorker is excluded since the spoke doesn't own it.
-    if (!(this.worker instanceof SharedWorker)) {
+    if (!(isSharedWorker(this.worker))) {
       this.worker.addEventListener('message', ((e: MessageEvent) => {
         if (e.data?.type === 'tab-election:leadership') {
           this._isLeader = e.data.isLeader;
@@ -571,6 +596,21 @@ export class Spoke {
   }
 
   /**
+   * Listen for hub worker recoveries initiated by this spoke — either because
+   * heartbeats stopped ('heartbeat') or because service calls kept timing out
+   * while heartbeats continued ('call-stall', a wedged hub). Useful for
+   * telemetry: recoveries should be rare, and a recurring one points at a
+   * reproducible hub wedge.
+   *
+   * @param listener - Function to call when this spoke recovers its worker
+   * @returns A function to unsubscribe the listener
+   */
+  onRecovery(listener: EventListener<RecoveryEvent>): UnsubscribeFunction {
+    this.onRecoveryListeners.add(listener);
+    return () => this.onRecoveryListeners.delete(listener);
+  }
+
+  /**
    * Get a type-safe stub for calling methods on a hub service.
    *
    * @param namespace - The namespace of the service to get (must match service's namespace)
@@ -613,7 +653,22 @@ export class Spoke {
           return undefined;
         }
         return async (...args: any[]) => {
-          return this.tab.call(`${namespace}.${prop as string}`, ...args);
+          try {
+            const result = await this.tab.call(`${namespace}.${prop as string}`, ...args);
+            this._consecutiveCallTimeouts = 0;
+            return result;
+          } catch (e) {
+            // A wedged hub keeps heartbeating (the heartbeat interval is
+            // independent of service-call drain), so heartbeat-gap recovery
+            // never fires — consecutive call timeouts are the liveness signal
+            // for that failure mode.
+            if (e instanceof Error && e.message === 'Call timed out') {
+              this._noteCallTimeout();
+            } else {
+              this._consecutiveCallTimeouts = 0;
+            }
+            throw e;
+          }
         };
       },
     }) as ServiceStub<T>;
@@ -634,9 +689,9 @@ export class Spoke {
    */
   close(): void {
     clearTimeout(this._heartbeatTimeout);
-    if (this.worker instanceof Worker) {
+    if (isDedicatedWorker(this.worker)) {
       this.worker.terminate();
-    } else if (this.worker instanceof SharedWorker) {
+    } else if (isSharedWorker(this.worker)) {
       this.worker.port.close();
     } else if (this.worker instanceof Hub) {
       this.worker.close();
@@ -650,9 +705,15 @@ export class Spoke {
     this.tab.addEventListener('message', (e: MessageEvent) => {
       if (e.data?.type === 'tab-election:heartbeat') {
         this._lastHeartbeat = Date.now();
-      } else if (e.data?.type === 'tab-election:recover' && this.worker instanceof SharedWorker) {
-        // SharedWorker recovery broadcasts — all spokes must switch together
-        this._recover(e.data.attempt);
+      } else if (e.data?.type === 'tab-election:recover') {
+        if (isSharedWorker(this.worker)) {
+          // SharedWorker recovery broadcasts — all spokes must switch together
+          this._recover(e.data.attempt, e.data.reason ?? 'heartbeat');
+        } else if (isDedicatedWorker(this.worker) && this._isLeader) {
+          // Dedicated workers: another spoke detected the leader stalling, and
+          // this spoke owns the leader — terminate it so leadership moves.
+          this._recover(e.data.attempt, e.data.reason ?? 'heartbeat');
+        }
       }
     });
 
@@ -660,16 +721,7 @@ export class Spoke {
       this._heartbeatTimeout = setTimeout(() => {
         // Only trigger recovery after receiving at least one heartbeat
         if (this._lastHeartbeat > 0 && Date.now() - this._lastHeartbeat > timeout) {
-          if (this.worker instanceof SharedWorker) {
-            // SharedWorker: broadcast so all spokes recover together
-            const attempt = this._recoveryAttempt + 1;
-            this.tab.send({ type: 'tab-election:recover', attempt });
-            this._recover(attempt);
-          } else if (this.worker instanceof Worker && this._isLeader) {
-            // Regular Worker: only recover if this spoke's worker is the hung leader.
-            // Terminate releases the lock, another tab's worker takes leadership.
-            this._recover(this._recoveryAttempt + 1);
-          }
+          this._initiateRecovery('heartbeat');
         }
         check();
       }, timeout);
@@ -677,18 +729,57 @@ export class Spoke {
     check();
   }
 
-  protected _recover(attempt: number): void {
+  /**
+   * Route a detected hub failure into the right recovery path for the worker
+   * mode: SharedWorker recoveries broadcast so every spoke switches together;
+   * dedicated-Worker recoveries must happen in the spoke that OWNS the hung
+   * leader, so a non-owner broadcasts and the owner acts (see the recover
+   * listener above).
+   */
+  protected _initiateRecovery(reason: RecoveryReason): void {
+    const attempt = this._recoveryAttempt + 1;
+    if (isSharedWorker(this.worker)) {
+      this.tab.send({ type: 'tab-election:recover', attempt, reason });
+      this._recover(attempt, reason);
+    } else if (isDedicatedWorker(this.worker)) {
+      if (this._isLeader) {
+        this._recover(attempt, reason);
+      } else {
+        this.tab.send({ type: 'tab-election:recover', attempt, reason });
+        // Advance our own attempt too: if the hub wedges again after the
+        // owner recovers at this attempt, the next broadcast must carry a
+        // higher number or the owner's dedup would ignore it.
+        this._recoveryAttempt = attempt;
+      }
+    }
+  }
+
+  protected _noteCallTimeout(): void {
+    this._consecutiveCallTimeouts++;
+    // Two consecutive timeouts (~2× callTimeout of unresponsiveness) marks the
+    // hub as wedged even though its heartbeat interval — which is independent
+    // of service-call drain — keeps firing. One timeout alone may just be a
+    // single slow call.
+    if (this._consecutiveCallTimeouts >= 2 && this._workerUrl) {
+      this._consecutiveCallTimeouts = 0;
+      this._initiateRecovery('call-stall');
+    }
+  }
+
+  protected _recover(attempt: number, reason: RecoveryReason = 'heartbeat'): void {
     if (attempt <= this._recoveryAttempt) return;
     this._recoveryAttempt = attempt;
+    this._consecutiveCallTimeouts = 0;
+    this.onRecoveryListeners.forEach(l => l({ reason, attempt }));
 
-    if (this.worker instanceof SharedWorker) {
+    if (isSharedWorker(this.worker)) {
       this.worker.port.close();
       // New SharedWorker with recovery suffix — same URL, same version,
       // different worker name so the browser creates a new process.
       // The Hub parses the recovery suffix and uses steal:true on the lock.
       const name = `${this.name}:${this.version}:recover-${attempt}`;
       this.worker = new SharedWorker(this._workerUrl!, { type: 'module', name });
-    } else if (this.worker instanceof Worker) {
+    } else if (isDedicatedWorker(this.worker)) {
       this.worker.terminate();
       // New Worker — lock was released by terminate, another tab's worker
       // or this new one will take leadership naturally.
