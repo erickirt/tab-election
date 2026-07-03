@@ -7,6 +7,17 @@ interface Deferred {
   resolve: (value: any) => void;
   reject: (reason?: any) => void;
   timeout: number;
+  /** Method name + args, kept so an in-flight call can be re-delivered when leadership changes. */
+  name: string;
+  rest: any[];
+}
+
+export interface TabOptions {
+  /**
+   * How long a call waits for a return before rejecting with `Error('Call timed out')`.
+   * Default 30s.
+   */
+  callTimeout?: number;
 }
 
 export enum To {
@@ -49,12 +60,14 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
   private _callCount = 0;
   private _api: any;
   private _sentCalls = new Map<number, any>();
+  private _callTimeout: number;
 
-  constructor(name = 'default') {
+  constructor(name = 'default', options?: TabOptions) {
     super();
     this._name = name;
     this._id = createTabId();
     this._state = {} as T;
+    this._callTimeout = options?.callTimeout ?? 30_000;
     this._createChannel();
     this.hasLeader().then(hasLeader => {
       if (hasLeader) this._postMessage(To.Leader, 'onSendState', this._id);
@@ -125,8 +138,18 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
         const keepLockPromise = new Promise<boolean>(resolve => (this.relinquishLeadership = () => resolve(true)));
         this._api = await onLeadership(this.relinquishLeadership);
         this._isLeaderReady = true;
+        const queued = new Set(this._queuedCalls.keys());
         this._queuedCalls.forEach(({ id, name, rest }, callNumber) => this._onCall(id, callNumber, name, ...rest));
         this._queuedCalls.clear();
+        // Re-deliver this tab's own calls that were in flight to the previous
+        // leader when it died — we are the leader now, so dispatch them to
+        // ourselves (see the matching re-delivery for non-leader tabs in
+        // `_onLeader`; the same at-least-once caveat applies).
+        this._callDeferreds.forEach(({ name, rest }, callNumber) => {
+          if (queued.has(callNumber)) return;
+          this._clearSentCall(callNumber);
+          this._onCall(this._id, callNumber, name, ...rest);
+        });
         this.dispatchEvent(new Event('leadershipchange'));
         this._postMessage(To.Others, 'onLeader', this._state);
         return keepLockPromise;
@@ -143,24 +166,41 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     return new Promise<R>(async (resolve, reject) => {
       const timeout = setTimeout(() => {
         this._callDeferreds.delete(callNumber);
+        this._clearSentCall(callNumber);
         reject(new Error('Call timed out'));
-      }, 30_000);
-      this._callDeferreds.set(callNumber, { resolve, reject, timeout });
+      }, this._callTimeout);
+      this._callDeferreds.set(callNumber, { resolve, reject, timeout, name, rest });
       const hasLeader = await this.hasLeader();
       if (this.isLeader && this._isLeaderReady) {
         this._onCall(this._id, callNumber, name, ...rest);
       } else if (!this.isLeader && hasLeader) {
-        // If the call isn't received by the leader within 500ms, assume the leader is dead and try again
-        const send = () => {
-          const t = setTimeout(() => this._sentCalls.has(callNumber) && send(), 500);
-          this._sentCalls.set(callNumber, t);
-          this._postMessage(To.Leader, 'onCall', this._id, callNumber, name, ...rest);
-        }
-        send();
+        this._sendCall(callNumber, name, rest);
       } else {
         this._queuedCalls.set(callNumber, { id: this._id, name, rest });
       }
     });
+  }
+
+  /**
+   * Post a call to the leader, re-posting every 500ms until the leader acks it
+   * with `callReceived` (a leader that never acks is assumed dead — the resend
+   * reaches its successor).
+   */
+  private _sendCall(callNumber: number, name: string, rest: any[]) {
+    const send = () => {
+      const t = setTimeout(() => this._sentCalls.has(callNumber) && send(), 500);
+      this._sentCalls.set(callNumber, t);
+      this._postMessage(To.Leader, 'onCall', this._id, callNumber, name, ...rest);
+    };
+    send();
+  }
+
+  private _clearSentCall(callNumber: number) {
+    const t = this._sentCalls.get(callNumber);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this._sentCalls.delete(callNumber);
+    }
   }
 
   send(data: any, to: string | Set<string> = To.Others): void {
@@ -245,11 +285,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
   }
 
   _callReceived(callNumber: number) {
-    const t = this._sentCalls.get(callNumber);
-    if (t) {
-      clearTimeout(t);
-      this._sentCalls.delete(callNumber);
-    }
+    this._clearSentCall(callNumber);
   }
 
   _onReturn(callNumber: number, error: any, results: any) {
@@ -279,10 +315,23 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
 
   _onLeader(state: T) {
     this._onState(state);
+    const queued = new Set(this._queuedCalls.keys());
     this._queuedCalls.forEach(({ id, name, rest }, callNumber) =>
       this._postMessage(To.Leader, 'onCall', id, callNumber, name, ...rest)
     );
     this._queuedCalls.clear();
+    // Re-deliver calls that were IN FLIGHT to the previous leader. The old
+    // leader acks `callReceived` before executing, which stops the 500ms
+    // resend loop — so a leader that died (or was recovered) after the ack but
+    // before returning leaves the call orphaned until its timeout. Any call
+    // still pending here that isn't already resending is re-sent to the new
+    // leader. Note this makes delivery at-least-once across leader handoff
+    // (it already was whenever a `callReceived` ack was lost): handlers whose
+    // execution may have completed on the dead leader must be idempotent.
+    this._callDeferreds.forEach(({ name, rest }, callNumber) => {
+      if (queued.has(callNumber) || this._sentCalls.has(callNumber)) return;
+      this._sendCall(callNumber, name, rest);
+    });
   }
 }
 
