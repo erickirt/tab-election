@@ -28,11 +28,33 @@ class FakeWorker extends EventTarget {
   postMessage() {}
 }
 
+class FakeSharedWorkerPort {
+  closed = false;
+  close() {
+    this.closed = true;
+  }
+  start() {}
+  postMessage() {}
+}
+
+class FakeSharedWorker extends EventTarget {
+  static instances: FakeSharedWorker[] = [];
+  port = new FakeSharedWorkerPort();
+  constructor(
+    public url: string,
+    public options?: { type?: string; name?: string },
+  ) {
+    super();
+    FakeSharedWorker.instances.push(this);
+  }
+}
+
 let spokes: Spoke[] = [];
 
 beforeEach(() => {
   installLocksFake();
   FakeWorker.instances = [];
+  FakeSharedWorker.instances = [];
   (globalThis as any).Worker = FakeWorker;
   delete (globalThis as any).SharedWorker;
 });
@@ -162,6 +184,23 @@ describe('Spoke boot-failure recovery and backoff', () => {
 
     expect(first.terminated).toBe(true);
     expect(FakeWorker.instances).toHaveLength(2);
+    expect(recoveries).toEqual([{ reason: 'boot-failure', attempt: 1 }]);
+  });
+
+  it('recovers a never-booted SharedWorker too: port closed, replacement carries the recovery suffix', () => {
+    (globalThis as any).SharedWorker = FakeSharedWorker;
+    const spoke = makeSpoke('boot-fail-shared', { useSharedWorker: true });
+    const recoveries: RecoveryEvent[] = [];
+    spoke.onRecovery(e => recoveries.push(e));
+
+    const first = FakeSharedWorker.instances[0];
+    first.dispatchEvent(new FakeErrorEvent('Failed to fetch worker script'));
+
+    expect(first.port.closed).toBe(true);
+    expect(FakeSharedWorker.instances).toHaveLength(2);
+    // The recovery suffix makes the browser mint a fresh SharedWorker process;
+    // the Hub parses it and takes the leadership lock with steal:true.
+    expect(FakeSharedWorker.instances[1].options?.name).toBe('boot-fail-shared:0.0.0:recover-1');
     expect(recoveries).toEqual([{ reason: 'boot-failure', attempt: 1 }]);
   });
 

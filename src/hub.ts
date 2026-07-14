@@ -605,6 +605,10 @@ export class Spoke {
       // A worker whose module script fails to fetch or parse (a deploy purged
       // the old hashed asset, the network is down, a syntax error) never runs
       // a line of code — this 'error' event is the only signal it exists.
+      // Best-effort: whether load/MIME failures fire a usable 'error' event
+      // (or any message) is browser-dependent. Detection here is only a
+      // fast path — a silent boot failure still lands in the backed-off
+      // heartbeat-gap recovery, which is the actual thrash guard.
       worker.addEventListener('error', ((e: Event) => {
         if (worker !== this.worker) return;
         const message = (e as ErrorEvent).message;
