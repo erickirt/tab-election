@@ -181,14 +181,40 @@ export interface SpokeOptions {
   useSharedWorker?: boolean;
   /** How long a service call waits for a return before rejecting with `Error('Call timed out')`. Default 30s. */
   callTimeout?: number;
+  /** Minimum delay between fruitless worker recoveries (ms). Doubles per fruitless recovery. Default 10s. */
+  recoveryBackoffMinMs?: number;
+  /** Ceiling for the recovery backoff (ms). Default 5 minutes. */
+  recoveryBackoffMaxMs?: number;
+  /** Fruitless recoveries (no heartbeat between them) before `onRecoveryFailed` fires. Default 5. */
+  maxFruitlessRecoveries?: number;
 }
 
-/** Why a spoke recovered its hub worker. */
-export type RecoveryReason = 'heartbeat' | 'call-stall';
+/**
+ * Why a spoke recovered its hub worker: heartbeats stopped ('heartbeat'),
+ * service calls kept timing out while heartbeats continued ('call-stall'), or
+ * the worker fired an 'error' event before ever producing a heartbeat
+ * ('boot-failure' — e.g. its module script failed to fetch or parse).
+ */
+export type RecoveryReason = 'heartbeat' | 'call-stall' | 'boot-failure';
 
 export interface RecoveryEvent {
   reason: RecoveryReason;
   attempt: number;
+}
+
+/**
+ * Fired once per wedge episode when repeated worker recoveries never produce
+ * a heartbeat — the worker is not coming back on its own (the classic cause: a
+ * deploy purged the old hashed worker script, so every respawn re-fetches a
+ * URL that no longer serves JavaScript). The app should escalate: surface the
+ * failure and, when it cannot lose user data, reload onto fresh assets.
+ * Recovery attempts continue at the backoff ceiling after this fires.
+ */
+export interface RecoveryFailedEvent {
+  /** Consecutive recoveries without a single heartbeat in between. */
+  attempts: number;
+  /** Message from the last worker 'error' event, when one fired (e.g. a failed script fetch). */
+  lastError?: string;
 }
 
 /**
@@ -492,6 +518,19 @@ export class Spoke {
   protected _lastHeartbeat = 0;
   protected _consecutiveCallTimeouts = 0;
   protected onRecoveryListeners = new Set<EventListener<RecoveryEvent>>();
+  protected onRecoveryFailedListeners = new Set<EventListener<RecoveryFailedEvent>>();
+  /** When the last worker recovery ran — the base the backoff gate measures from. */
+  protected _lastRecoverAt = 0;
+  /** Recoveries since the last heartbeat; >0 means the episode is so far fruitless. */
+  protected _recoveriesSinceHeartbeat = 0;
+  /** Whether any heartbeat has arrived since the current worker spawned. */
+  protected _heartbeatSinceSpawn = false;
+  /** Message from the newest worker 'error' event this episode, for RecoveryFailedEvent. */
+  protected _lastWorkerError?: string;
+  protected _recoveryFailedFired = false;
+  protected _recoveryBackoffMinMs: number;
+  protected _recoveryBackoffMaxMs: number;
+  protected _maxFruitlessRecoveries: number;
 
   readonly name: string;
   readonly version?: string;
@@ -512,6 +551,9 @@ export class Spoke {
   constructor(options: SpokeOptions) {
     this.name = options.name || 'default';
     this.version = options.version || '0.0.0';
+    this._recoveryBackoffMinMs = options.recoveryBackoffMinMs ?? 10_000;
+    this._recoveryBackoffMaxMs = options.recoveryBackoffMaxMs ?? 300_000;
+    this._maxFruitlessRecoveries = options.maxFruitlessRecoveries ?? 5;
     this.tab = new Tab(`hub/${this.name}/${this.version}`, { callTimeout: options.callTimeout });
     this.tab.addEventListener('state', event => {
       this.onStateListeners.forEach(listener => listener(event.data));
@@ -534,20 +576,50 @@ export class Spoke {
       }
     }
 
-    // Listen for leadership changes from the worker (regular Worker via postMessage,
-    // in-tab Hub via EventTarget). SharedWorker is excluded since the spoke doesn't own it.
-    if (!(isSharedWorker(this.worker))) {
-      this.worker.addEventListener('message', ((e: MessageEvent) => {
+    this._attachWorkerListeners(this.worker);
+
+    // Monitor heartbeats from the hub for worker recovery
+    if (this._workerUrl) {
+      this._startHeartbeatMonitoring();
+    }
+  }
+
+  /**
+   * Attach the per-worker listeners: leadership changes (regular Worker via
+   * postMessage, in-tab Hub via EventTarget — SharedWorker is excluded since
+   * the spoke doesn't own it) and worker 'error' (real workers only). Called
+   * for the initial worker and again for every replacement `_recover` spawns;
+   * each listener ignores events once its worker has been replaced.
+   */
+  protected _attachWorkerListeners(worker: Worker | SharedWorker | Hub): void {
+    if (!isSharedWorker(worker)) {
+      worker.addEventListener('message', ((e: MessageEvent) => {
+        if (worker !== this.worker) return;
         if (e.data?.type === 'tab-election:leadership') {
           this._isLeader = e.data.isLeader;
           this.onLeaderChangeListeners.forEach(l => l(e.data.isLeader));
         }
       }) as EventListener);
     }
-
-    // Monitor heartbeats from the hub for worker recovery
-    if (this._workerUrl) {
-      this._startHeartbeatMonitoring();
+    if (isDedicatedWorker(worker) || isSharedWorker(worker)) {
+      // A worker whose module script fails to fetch or parse (a deploy purged
+      // the old hashed asset, the network is down, a syntax error) never runs
+      // a line of code — this 'error' event is the only signal it exists.
+      // Best-effort: whether load/MIME failures fire a usable 'error' event
+      // (or any message) is browser-dependent. Detection here is only a
+      // fast path — a silent boot failure still lands in the backed-off
+      // heartbeat-gap recovery, which is the actual thrash guard.
+      worker.addEventListener('error', ((e: Event) => {
+        if (worker !== this.worker) return;
+        const message = (e as ErrorEvent).message;
+        this._lastWorkerError = typeof message === 'string' && message ? message : 'worker error event';
+        // Only treat it as a boot failure while no heartbeat has arrived since
+        // this worker spawned — a runtime error in a live hub is not fatal
+        // (call-stall detection owns actual wedges).
+        if (!this._heartbeatSinceSpawn && this._workerUrl) {
+          this._initiateRecovery('boot-failure');
+        }
+      }) as EventListener);
     }
   }
 
@@ -608,6 +680,23 @@ export class Spoke {
   onRecovery(listener: EventListener<RecoveryEvent>): UnsubscribeFunction {
     this.onRecoveryListeners.add(listener);
     return () => this.onRecoveryListeners.delete(listener);
+  }
+
+  /**
+   * Listen for the terminal recovery signal: repeated worker recoveries have
+   * produced no heartbeat, so the worker is not coming back on its own (see
+   * {@link RecoveryFailedEvent}). Fires at most once per wedge episode — a
+   * later heartbeat closes the episode and re-arms it. The spoke keeps
+   * retrying at the backoff ceiling after it fires; the app should escalate
+   * (surface the failure, and reload onto fresh assets when that cannot lose
+   * user data).
+   *
+   * @param listener - Function to call when recovery is declared failed
+   * @returns A function to unsubscribe the listener
+   */
+  onRecoveryFailed(listener: EventListener<RecoveryFailedEvent>): UnsubscribeFunction {
+    this.onRecoveryFailedListeners.add(listener);
+    return () => this.onRecoveryFailedListeners.delete(listener);
   }
 
   /**
@@ -705,6 +794,11 @@ export class Spoke {
     this.tab.addEventListener('message', (e: MessageEvent) => {
       if (e.data?.type === 'tab-election:heartbeat') {
         this._lastHeartbeat = Date.now();
+        this._heartbeatSinceSpawn = true;
+        // A heartbeat means a live hub — whatever episode was running is over.
+        this._recoveriesSinceHeartbeat = 0;
+        this._recoveryFailedFired = false;
+        this._lastWorkerError = undefined;
       } else if (e.data?.type === 'tab-election:recover') {
         if (isSharedWorker(this.worker)) {
           // SharedWorker recovery broadcasts — all spokes must switch together
@@ -742,7 +836,12 @@ export class Spoke {
       this.tab.send({ type: 'tab-election:recover', attempt, reason });
       this._recover(attempt, reason);
     } else if (isDedicatedWorker(this.worker)) {
-      if (this._isLeader) {
+      if (this._isLeader || !this._heartbeatSinceSpawn) {
+        // Leaders own the hung worker and recover it directly. A spoke whose
+        // worker has never been alive since it spawned (no heartbeat — e.g.
+        // its script failed to load) also recovers its own: that worker never
+        // claimed leadership so there is no owner to broadcast to, and
+        // terminating it cannot disturb a live leader.
         this._recover(attempt, reason);
       } else {
         this.tab.send({ type: 'tab-election:recover', attempt, reason });
@@ -766,10 +865,30 @@ export class Spoke {
     }
   }
 
+  /**
+   * Delay required before the next respawn: nothing for the first recovery of
+   * an episode, then doubling per fruitless recovery (one that produced no
+   * heartbeat) up to the ceiling.
+   */
+  protected _recoveryBackoffMs(): number {
+    if (this._recoveriesSinceHeartbeat === 0) return 0;
+    return Math.min(this._recoveryBackoffMinMs * 2 ** (this._recoveriesSinceHeartbeat - 1), this._recoveryBackoffMaxMs);
+  }
+
   protected _recover(attempt: number, reason: RecoveryReason = 'heartbeat'): void {
     if (attempt <= this._recoveryAttempt) return;
+    // Pace respawns. A worker that can never come back — its script URL now
+    // serves the SPA fallback because a newer deploy purged the old hashed
+    // asset — would otherwise be terminated and re-fetched on every heartbeat
+    // gap: an infinite ~6/min thrash observed fleet-wide in production
+    // (2026-07-14). Skipping leaves `_recoveryAttempt` unchanged so the same
+    // attempt re-qualifies once the backoff window has passed.
+    if (Date.now() - this._lastRecoverAt < this._recoveryBackoffMs()) return;
     this._recoveryAttempt = attempt;
+    this._lastRecoverAt = Date.now();
+    this._recoveriesSinceHeartbeat++;
     this._consecutiveCallTimeouts = 0;
+    this._heartbeatSinceSpawn = false;
     this.onRecoveryListeners.forEach(l => l({ reason, attempt }));
 
     if (isSharedWorker(this.worker)) {
@@ -779,19 +898,21 @@ export class Spoke {
       // The Hub parses the recovery suffix and uses steal:true on the lock.
       const name = `${this.name}:${this.version}:recover-${attempt}`;
       this.worker = new SharedWorker(this._workerUrl!, { type: 'module', name });
+      this._attachWorkerListeners(this.worker);
     } else if (isDedicatedWorker(this.worker)) {
       this.worker.terminate();
       // New Worker — lock was released by terminate, another tab's worker
       // or this new one will take leadership naturally.
       const name = `${this.name}:${this.version}`;
       this.worker = new Worker(this._workerUrl!, { type: 'module', name });
-      // Re-attach leadership change listener on the new worker
-      this.worker.addEventListener('message', ((e: MessageEvent) => {
-        if (e.data?.type === 'tab-election:leadership') {
-          this._isLeader = e.data.isLeader;
-          this.onLeaderChangeListeners.forEach(l => l(e.data.isLeader));
-        }
-      }) as EventListener);
+      this._attachWorkerListeners(this.worker);
+    }
+
+    if (this._recoveriesSinceHeartbeat > this._maxFruitlessRecoveries && !this._recoveryFailedFired) {
+      this._recoveryFailedFired = true;
+      const event: RecoveryFailedEvent = { attempts: this._recoveriesSinceHeartbeat };
+      if (this._lastWorkerError !== undefined) event.lastError = this._lastWorkerError;
+      this.onRecoveryFailedListeners.forEach(l => l(event));
     }
   }
 }
