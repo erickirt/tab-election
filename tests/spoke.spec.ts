@@ -142,14 +142,13 @@ describe('Spoke call-stall recovery', () => {
     expect(ownerRecoveries).toEqual([{ reason: 'call-stall', attempt: 1 }]);
   });
 
-  it('a successful call resets the stall counter', async () => {
+  it('a successful call resets the stall counter for that method', async () => {
     const spoke = makeSpoke('stall-reset');
     setLeader(spoke, true);
     const svc = spoke.getService<any>('svc');
 
     await expect(svc.doWork()).rejects.toThrow('Call timed out');
     // A hub comes alive and answers one call — the earlier timeout must not count anymore.
-    (spoke as any)._consecutiveCallTimeouts = (spoke as any)._consecutiveCallTimeouts; // (no-op, readability)
     const { Tab } = await import('../src/tab');
     const hubTab = new Tab('hub/stall-reset/0.0.0');
     hubTab.waitForLeadership(() => ({ svc: { doWork: async () => 'ok' } }));
@@ -162,6 +161,56 @@ describe('Spoke call-stall recovery', () => {
     const first = FakeWorker.instances[0];
     await expect(svc.doWork()).rejects.toThrow('Call timed out');
     expect(first.terminated).toBe(false); // counter was reset — this is timeout #1, not #2
+  });
+
+  /**
+   * The write-path-only wedge (DAB-684, 2026-07-15): a hub whose write loop has
+   * starved while its RPC dispatcher still answers cheap reads. A user sat
+   * wedged for 86 minutes with ZERO recoveries because the spoke-wide counter
+   * was zeroed by unrelated healthy traffic — presence leases every 20s, tab
+   * pings every 30s, liveness probes every 15s — between write timeouts ~2min
+   * apart. The starved path must reach the threshold on its own evidence.
+   */
+  it('a successful call to a DIFFERENT method does not reset the stall counter', async () => {
+    const spoke = makeSpoke('stall-per-method');
+    setLeader(spoke, true);
+    const recoveries: RecoveryEvent[] = [];
+    spoke.onRecovery(e => recoveries.push(e));
+    const svc = spoke.getService<any>('svc');
+
+    // A hub that answers `ping` but never drains `doWork` — the wedge shape.
+    // `doWork` must EXIST and hang: an absent method rejects as "Invalid API
+    // method", which comes back through the hub and counts as liveness.
+    const { Tab } = await import('../src/tab');
+    const hubTab = new Tab('hub/stall-per-method/0.0.0');
+    hubTab.waitForLeadership(() => ({
+      svc: { ping: async () => 'pong', doWork: () => new Promise<never>(() => {}) },
+    }));
+    await wait(20);
+
+    const first = FakeWorker.instances[0];
+    await expect(svc.doWork()).rejects.toThrow('Call timed out');
+    await expect(svc.ping()).resolves.toBe('pong'); // healthy traffic must not erase the evidence
+    await expect(svc.doWork()).rejects.toThrow('Call timed out');
+
+    expect(first.terminated).toBe(true);
+    expect(recoveries).toEqual([{ reason: 'call-stall', attempt: 1 }]);
+
+    hubTab.relinquishLeadership();
+    hubTab.close();
+  });
+
+  it('counts timeouts on different methods separately', async () => {
+    const spoke = makeSpoke('stall-independent');
+    setLeader(spoke, true);
+    const svc = spoke.getService<any>('svc');
+
+    const first = FakeWorker.instances[0];
+    // One timeout each on two methods is not two consecutive timeouts on either.
+    await expect(svc.doWork()).rejects.toThrow('Call timed out');
+    await expect(svc.otherWork()).rejects.toThrow('Call timed out');
+
+    expect(first.terminated).toBe(false);
   });
 });
 

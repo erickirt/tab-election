@@ -516,7 +516,18 @@ export class Spoke {
   protected _recoveryAttempt = 0;
   protected _heartbeatTimeout?: ReturnType<typeof setTimeout>;
   protected _lastHeartbeat = 0;
-  protected _consecutiveCallTimeouts = 0;
+  /**
+   * Consecutive `Call timed out` rejections per `namespace.method`, NOT per
+   * spoke. A hub can wedge on ONE code path while every other path stays
+   * responsive — the observed shape is a hub whose write loop has starved
+   * while its RPC dispatcher still answers cheap reads. A single spoke-wide
+   * counter cannot see that: any successful call anywhere zeroes it, and a
+   * real app is always chattering on something (presence leases, tab pings,
+   * liveness probes), so the wedged path's timeouts never accumulate and the
+   * worker is never respawned. Keying by method lets a starved path reach the
+   * threshold on its own evidence while healthy traffic flows past it.
+   */
+  protected _consecutiveCallTimeouts = new Map<string, number>();
   protected onRecoveryListeners = new Set<EventListener<RecoveryEvent>>();
   protected onRecoveryFailedListeners = new Set<EventListener<RecoveryFailedEvent>>();
   /** When the last worker recovery ran — the base the backoff gate measures from. */
@@ -742,9 +753,10 @@ export class Spoke {
           return undefined;
         }
         return async (...args: any[]) => {
+          const method = `${namespace}.${prop as string}`;
           try {
-            const result = await this.tab.call(`${namespace}.${prop as string}`, ...args);
-            this._consecutiveCallTimeouts = 0;
+            const result = await this.tab.call(method, ...args);
+            this._consecutiveCallTimeouts.delete(method);
             return result;
           } catch (e) {
             // A wedged hub keeps heartbeating (the heartbeat interval is
@@ -752,9 +764,12 @@ export class Spoke {
             // never fires — consecutive call timeouts are the liveness signal
             // for that failure mode.
             if (e instanceof Error && e.message === 'Call timed out') {
-              this._noteCallTimeout();
+              this._noteCallTimeout(method);
             } else {
-              this._consecutiveCallTimeouts = 0;
+              // The rejection came back THROUGH the hub, so this path drained —
+              // it is as much proof of liveness as a resolved call, but only
+              // for this method.
+              this._consecutiveCallTimeouts.delete(method);
             }
             throw e;
           }
@@ -853,14 +868,18 @@ export class Spoke {
     }
   }
 
-  protected _noteCallTimeout(): void {
-    this._consecutiveCallTimeouts++;
-    // Two consecutive timeouts (~2× callTimeout of unresponsiveness) marks the
-    // hub as wedged even though its heartbeat interval — which is independent
-    // of service-call drain — keeps firing. One timeout alone may just be a
-    // single slow call.
-    if (this._consecutiveCallTimeouts >= 2 && this._workerUrl) {
-      this._consecutiveCallTimeouts = 0;
+  protected _noteCallTimeout(method: string): void {
+    const timeouts = (this._consecutiveCallTimeouts.get(method) ?? 0) + 1;
+    this._consecutiveCallTimeouts.set(method, timeouts);
+    // Two consecutive timeouts (~2× callTimeout of unresponsiveness) on the
+    // SAME method marks the hub as wedged even though its heartbeat interval —
+    // which is independent of service-call drain — keeps firing. One timeout
+    // alone may just be a single slow call. The threshold is per-method
+    // because a starved path proves the wedge on its own: waiting for the
+    // whole spoke to go quiet would mean never recovering a hub that still
+    // answers everything except the one thing that matters.
+    if (timeouts >= 2 && this._workerUrl) {
+      this._consecutiveCallTimeouts.delete(method);
       this._initiateRecovery('call-stall');
     }
   }
@@ -887,7 +906,9 @@ export class Spoke {
     this._recoveryAttempt = attempt;
     this._lastRecoverAt = Date.now();
     this._recoveriesSinceHeartbeat++;
-    this._consecutiveCallTimeouts = 0;
+    // Fresh worker: every path starts from a clean slate, not just the one
+    // whose timeouts triggered this recovery.
+    this._consecutiveCallTimeouts.clear();
     this._heartbeatSinceSpawn = false;
     this.onRecoveryListeners.forEach(l => l({ reason, attempt }));
 
