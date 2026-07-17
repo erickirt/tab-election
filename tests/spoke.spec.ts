@@ -319,3 +319,90 @@ describe('Spoke boot-failure recovery and backoff', () => {
     expect(failures).toHaveLength(0);
   });
 });
+
+/**
+ * Pins the suspend-aware heartbeat gap check: a spoke waking from suspension
+ * (system sleep, a backgrounded mobile tab, Safari tab suspension) sees a
+ * heartbeat as stale as the sleep was long — but the hub's clocks were frozen
+ * too, so that gap proves nothing. Recovering on it respawned a perfectly
+ * live hub on every wake, ~1,600 users/day in production telemetry.
+ */
+describe('Spoke heartbeat-gap recovery', () => {
+  const TIMEOUT = 5000;
+
+  function gapCheck(spoke: Spoke, opts: { lastHeartbeatAgo: number; firedLateBy?: number }): boolean {
+    const now = Date.now();
+    (spoke as any)._lastHeartbeat = opts.lastHeartbeatAgo === Infinity ? 0 : now - opts.lastHeartbeatAgo;
+    const scheduledAt = now - TIMEOUT - (opts.firedLateBy ?? 0);
+    return (spoke as any)._shouldRecoverOnHeartbeatGap(scheduledAt, TIMEOUT);
+  }
+
+  it('recovers on a genuine gap when the check timer fired on schedule', () => {
+    const spoke = makeSpoke('gap-genuine');
+    expect(gapCheck(spoke, { lastHeartbeatAgo: TIMEOUT * 3 })).toBe(true);
+  });
+
+  it('tolerates ordinary timer jank within the grace window', () => {
+    const spoke = makeSpoke('gap-jank');
+    expect(gapCheck(spoke, { lastHeartbeatAgo: TIMEOUT * 3, firedLateBy: 500 })).toBe(true);
+  });
+
+  it('stays quiet while heartbeats are fresh', () => {
+    const spoke = makeSpoke('gap-fresh');
+    expect(gapCheck(spoke, { lastHeartbeatAgo: 1000 })).toBe(false);
+  });
+
+  it('never fires before the first heartbeat (boot failures own that path)', () => {
+    const spoke = makeSpoke('gap-boot');
+    expect(gapCheck(spoke, { lastHeartbeatAgo: Infinity })).toBe(false);
+  });
+
+  it('skips the check that wakes from suspension instead of recovering a live hub', () => {
+    const spoke = makeSpoke('gap-suspend');
+    const twoHours = 2 * 60 * 60 * 1000;
+    expect(gapCheck(spoke, { lastHeartbeatAgo: twoHours, firedLateBy: twoHours })).toBe(false);
+  });
+
+  class FastHeartbeatSpoke extends Spoke {
+    protected _heartbeatCheckIntervalMs(): number {
+      return 60;
+    }
+  }
+
+  function makeFastSpoke(name: string): Spoke {
+    const spoke = new FastHeartbeatSpoke({ workerUrl: 'fake-hub.js', name, callTimeout: 150 });
+    spokes.push(spoke);
+    return spoke;
+  }
+
+  it('still recovers a hub that genuinely stops heartbeating', async () => {
+    const spoke = makeFastSpoke('gap-dead');
+    setLeader(spoke, true);
+    const recoveries: RecoveryEvent[] = [];
+    spoke.onRecovery(e => recoveries.push(e));
+
+    await sendHeartbeat('gap-dead');
+    // Silence. The next on-schedule check sees the gap and respawns the worker.
+    await wait(250);
+
+    expect(recoveries.length).toBeGreaterThanOrEqual(1);
+    expect(recoveries[0].reason).toBe('heartbeat');
+    expect(FakeWorker.instances.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not recover while heartbeats keep flowing', async () => {
+    const spoke = makeFastSpoke('gap-alive');
+    setLeader(spoke, true);
+    const recoveries: RecoveryEvent[] = [];
+    spoke.onRecovery(e => recoveries.push(e));
+
+    const hubTab = new Tab('hub/gap-alive/0.0.0');
+    const beat = setInterval(() => hubTab.send({ type: 'tab-election:heartbeat' }), 15);
+    await wait(300);
+    clearInterval(beat);
+    hubTab.close();
+
+    expect(recoveries).toEqual([]);
+    expect(FakeWorker.instances).toHaveLength(1);
+  });
+});
