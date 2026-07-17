@@ -803,8 +803,7 @@ export class Spoke {
   }
 
   protected _startHeartbeatMonitoring(): void {
-    // Randomized timeout between 5-10s per spoke instance
-    const timeout = 5000 + Math.random() * 5000;
+    const timeout = this._heartbeatCheckIntervalMs();
 
     this.tab.addEventListener('message', (e: MessageEvent) => {
       if (e.data?.type === 'tab-election:heartbeat') {
@@ -827,15 +826,49 @@ export class Spoke {
     });
 
     const check = () => {
+      const scheduledAt = Date.now();
       this._heartbeatTimeout = setTimeout(() => {
-        // Only trigger recovery after receiving at least one heartbeat
-        if (this._lastHeartbeat > 0 && Date.now() - this._lastHeartbeat > timeout) {
+        if (this._shouldRecoverOnHeartbeatGap(scheduledAt, timeout)) {
           this._initiateRecovery('heartbeat');
         }
         check();
       }, timeout);
     };
     check();
+  }
+
+  /** Randomized 5-10s per spoke instance. Overridable so tests can run fast. */
+  protected _heartbeatCheckIntervalMs(): number {
+    return 5000 + Math.random() * 5000;
+  }
+
+  /**
+   * How much later than scheduled a heartbeat check may fire before the gap it
+   * measures is considered untrustworthy (see _shouldRecoverOnHeartbeatGap).
+   * Loose enough for ordinary main-thread jank; a suspension overshoots it by
+   * orders of magnitude.
+   */
+  protected _heartbeatLateGraceMs(): number {
+    return 2000;
+  }
+
+  /**
+   * Whether a heartbeat-gap recovery should fire for the check window that
+   * opened at `scheduledAt`. Only ever true after at least one heartbeat has
+   * been seen (boot failures have their own detection).
+   *
+   * A check timer that fired much later than scheduled means this whole
+   * context was suspended — system sleep, a backgrounded mobile tab, Safari
+   * tab suspension. The hub's clocks were frozen right along with ours, so a
+   * stale `_lastHeartbeat` proves nothing about its health; recovering on it
+   * would respawn a perfectly live hub on every wake. Skip that round and let
+   * a clean window decide: a live hub heartbeats within ~2s of resuming, and a
+   * genuinely dead one is still recovered one interval later.
+   */
+  protected _shouldRecoverOnHeartbeatGap(scheduledAt: number, timeout: number): boolean {
+    const now = Date.now();
+    if (now - scheduledAt - timeout > this._heartbeatLateGraceMs()) return false;
+    return this._lastHeartbeat > 0 && now - this._lastHeartbeat > timeout;
   }
 
   /**
