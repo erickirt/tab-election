@@ -52,7 +52,9 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
   private _hasLeaderChecking: Promise<boolean>;
   private _callerId: string;
   private _callDeferreds = new Map<number, Deferred>();
-  private _queuedCalls = new Map<number, { id: string; name: string; rest: any[] }>();
+  // Keyed by `${callerId}:${callNumber}` — callNumber is a per-tab counter, so on the
+  // leader (which queues calls from every tab) the number alone collides across callers.
+  private _queuedCalls = new Map<string, { id: string; callNumber: number; name: string; rest: any[] }>();
   private _channel: BroadcastChannel;
   private _isLeader = false;
   private _isLeaderReady = false;
@@ -152,14 +154,14 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
         if (!relinquished) {
           this._isLeaderReady = true;
           const queued = new Set(this._queuedCalls.keys());
-          this._queuedCalls.forEach(({ id, name, rest }, callNumber) => this._onCall(id, callNumber, name, ...rest));
+          this._queuedCalls.forEach(({ id, callNumber, name, rest }) => this._onCall(id, callNumber, name, ...rest));
           this._queuedCalls.clear();
           // Re-deliver this tab's own calls that were in flight to the previous
           // leader when it died — we are the leader now, so dispatch them to
           // ourselves (see the matching re-delivery for non-leader tabs in
           // `_onLeader`; the same at-least-once caveat applies).
           this._callDeferreds.forEach(({ name, rest }, callNumber) => {
-            if (queued.has(callNumber)) return;
+            if (queued.has(`${this._id}:${callNumber}`)) return;
             this._clearSentCall(callNumber);
             this._onCall(this._id, callNumber, name, ...rest);
           });
@@ -181,7 +183,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     return new Promise<R>(async (resolve, reject) => {
       const timeout = setTimeout(() => {
         this._callDeferreds.delete(callNumber);
-        this._queuedCalls.delete(callNumber);
+        this._queuedCalls.delete(`${this._id}:${callNumber}`);
         this._clearSentCall(callNumber);
         reject(new Error('Call timed out'));
       }, this._callTimeout);
@@ -192,7 +194,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
       } else if (!this.isLeader && hasLeader) {
         this._sendCall(callNumber, name, rest);
       } else {
-        this._queuedCalls.set(callNumber, { id: this._id, name, rest });
+        this._queuedCalls.set(`${this._id}:${callNumber}`, { id: this._id, callNumber, name, rest });
       }
     });
   }
@@ -282,7 +284,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     if (!this.isLeader) return;
     this._postMessage(id, 'callReceived', callNumber);
     if (!this._isLeaderReady) {
-      this._queuedCalls.set(callNumber, { id, name, rest });
+      this._queuedCalls.set(`${id}:${callNumber}`, { id, callNumber, name, rest });
       return;
     }
     try {
@@ -333,7 +335,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
   _onLeader(state: T) {
     this._onState(state);
     const queued = new Set(this._queuedCalls.keys());
-    this._queuedCalls.forEach(({ id, name, rest }, callNumber) =>
+    this._queuedCalls.forEach(({ id, callNumber, name, rest }) =>
       this._postMessage(To.Leader, 'onCall', id, callNumber, name, ...rest)
     );
     this._queuedCalls.clear();
@@ -346,7 +348,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     // (it already was whenever a `callReceived` ack was lost): handlers whose
     // execution may have completed on the dead leader must be idempotent.
     this._callDeferreds.forEach(({ name, rest }, callNumber) => {
-      if (queued.has(callNumber) || this._sentCalls.has(callNumber)) return;
+      if (queued.has(`${this._id}:${callNumber}`) || this._sentCalls.has(callNumber)) return;
       this._sendCall(callNumber, name, rest);
     });
   }

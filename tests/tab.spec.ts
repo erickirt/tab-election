@@ -184,6 +184,28 @@ describe('Tab leadership lifecycle', () => {
     expect(locks.pendingCount(`tab-${name}`)).toBe(0);
   });
 
+
+  it('queues calls from two callers with the same call number without collision', async () => {
+    // The initializing leader's OWN first call and a spoke's first call are both
+    // callNumber 1 in their tabs. Keyed by number alone they collide in the leader's
+    // queue, and the loser is then skipped by the own-call re-delivery guard — a
+    // spoke-vs-spoke collision self-heals via onLeader re-delivery, but this one
+    // orphans until the call timeout.
+    let ready!: (api: any) => void;
+    const leader = makeTab({ callTimeout: 1500 });
+    void leader.waitForLeadership(() => new Promise(resolve => (ready = resolve)));
+    await wait(20);
+
+    const own = leader.call('svc.work', 'own');
+    const spoke = makeTab({ callTimeout: 1500 });
+    const foreign = spoke.call('svc.work', 'foreign');
+    await wait(50);
+
+    ready({ svc: { work: async (x: string) => x } });
+    await expect(own).resolves.toBe('own');
+    await expect(foreign).resolves.toBe('foreign');
+  });
+
   it('surfaces non-cloneable payload errors from setState instead of swallowing them', async () => {
     const tab = makeTab();
     tab.waitForLeadership(() => ({}));
