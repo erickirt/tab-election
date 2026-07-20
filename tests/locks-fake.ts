@@ -66,6 +66,11 @@ export class LocksFake {
     });
   }
 
+  /** Requests still waiting in the queue for `name` (the current holder excluded). */
+  pendingCount(name: string): number {
+    return this.queues.get(name)?.length ?? 0;
+  }
+
   private grant(name: string, waiter: Pick<Waiter, 'cb' | 'resolve' | 'reject'>): void {
     let abort!: (reason: unknown) => void;
     const aborted = new Promise((_, rej) => (abort = rej));
@@ -74,7 +79,10 @@ export class LocksFake {
     finished
       .then(waiter.resolve, waiter.reject)
       .finally(() => {
-        if (this.held.get(name)?.finished === finished) this.held.delete(name);
+        // A holder evicted by `steal` is no longer the current record and must not drive the queue: the thief holds
+        // the lock now, and its own release grants the next waiter.
+        if (this.held.get(name)?.finished !== finished) return;
+        this.held.delete(name);
         const next = this.queues.get(name)?.shift();
         if (next) this.grant(name, next);
       });
