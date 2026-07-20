@@ -211,6 +211,72 @@ describe('Tab leadership lifecycle', () => {
     tab.waitForLeadership(() => ({}));
     await wait(20);
 
-    expect(() => tab.setState({ fn: () => {} } as any)).toThrow();
+    const before = tab.getState();
+    let stateEvents = 0;
+    tab.addEventListener('state', () => stateEvents++);
+
+    expect(() => tab.setState({ fn: () => {} } as any)).toThrow(/could not be cloned|DataCloneError/);
+    // The broadcast must happen before the store, so a state no peer could receive is not left behind.
+    expect(tab.getState()).toBe(before);
+    expect(stateEvents).toBe(0);
+  });
+});
+
+describe('Tab postMessage failure paths', () => {
+  it('fails only the uncloneable queued call and still forwards the rest to the new leader', async () => {
+    // All three queue while there is no leader; the uncloneable one throws mid-sweep in `_onLeader`, and the
+    // queued call after it must still reach the new leader.
+    const spoke = makeTab({ callTimeout: 1500 });
+    const good1 = spoke.call('svc.work', 'a');
+    const bad = spoke.call('svc.work', () => {});
+    const badResult = bad.then(() => null, e => e);
+    const good2 = spoke.call('svc.work', 'c');
+    await wait(20);
+
+    const leader = makeTab();
+    leader.waitForLeadership(() => ({ svc: { work: async (x: string) => x } }));
+
+    await expect(good1).resolves.toBe('a');
+    await expect(good2).resolves.toBe('c');
+    expect((await badResult)?.message).toMatch(/could not be cloned|DataCloneError/);
+  });
+
+  it('rejects a call with an uncloneable argument immediately instead of at the timeout', async () => {
+    const leader = makeTab();
+    leader.waitForLeadership(() => ({ svc: { work: async (x: any) => x } }));
+    await wait(20);
+
+    const spoke = makeTab({ callTimeout: 5000 });
+    const started = Date.now();
+    await expect(spoke.call('svc.work', () => {})).rejects.toThrow(/could not be cloned|DataCloneError/);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe('Tab close', () => {
+  it('reports no leader and rejects calls once closed', async () => {
+    const leader = makeTab();
+    leader.waitForLeadership(() => ({ svc: { work: async () => 'ok' } }));
+    await wait(20);
+
+    const spoke = makeTab({ callTimeout: 5000 });
+    await expect(spoke.hasLeader()).resolves.toBe(true);
+
+    spoke.close();
+    await expect(spoke.hasLeader()).resolves.toBe(false);
+
+    const started = Date.now();
+    await expect(spoke.call('svc.work')).rejects.toThrow('Tab is closed');
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('does not resurrect its channel when something posts after close', async () => {
+    const tab = makeTab();
+    tab.close();
+    const channel = (tab as any)._channel;
+
+    expect(() => tab.send('anyone there?')).not.toThrow();
+    expect((tab as any)._channel).toBe(channel);
+    expect(channel.onmessage).toBe(null);
   });
 });
