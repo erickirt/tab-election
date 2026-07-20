@@ -61,6 +61,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
   private _api: any;
   private _sentCalls = new Map<number, any>();
   private _callTimeout: number;
+  private _closeAbort = new AbortController();
 
   constructor(name = 'default', options?: TabOptions) {
     super();
@@ -102,8 +103,10 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
       // workaround to make sure the winner runs first.
       hasLeader = await check();
       this._hasLeaderCache = hasLeader;
-      // wait to know when there is no longer a leader
-      navigator.locks.request(`tab-${this._name}`, () => this._hasLeaderCache = false);
+      // wait to know when there is no longer a leader; aborted on close so a closed tab doesn't linger in the queue
+      navigator.locks
+        .request(`tab-${this._name}`, { signal: this._closeAbort.signal }, () => this._hasLeaderCache = false)
+        .catch(() => {});
       this._hasLeaderChecking = null;
       return hasLeader;
     });
@@ -135,27 +138,39 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
       return await navigator.locks.request(`tab-${this._name}`, lockOptions, async lock => {
         this._isLeader = true;
         // Never resolve until relinquishLeadership is called
-        const keepLockPromise = new Promise<boolean>(resolve => (this.relinquishLeadership = () => resolve(true)));
+        let relinquished = false;
+        const keepLockPromise = new Promise<boolean>(
+          resolve =>
+            (this.relinquishLeadership = () => {
+              relinquished = true;
+              resolve(true);
+            })
+        );
         this._api = await onLeadership(this.relinquishLeadership);
-        this._isLeaderReady = true;
-        const queued = new Set(this._queuedCalls.keys());
-        this._queuedCalls.forEach(({ id, name, rest }, callNumber) => this._onCall(id, callNumber, name, ...rest));
-        this._queuedCalls.clear();
-        // Re-deliver this tab's own calls that were in flight to the previous
-        // leader when it died — we are the leader now, so dispatch them to
-        // ourselves (see the matching re-delivery for non-leader tabs in
-        // `_onLeader`; the same at-least-once caveat applies).
-        this._callDeferreds.forEach(({ name, rest }, callNumber) => {
-          if (queued.has(callNumber)) return;
-          this._clearSentCall(callNumber);
-          this._onCall(this._id, callNumber, name, ...rest);
-        });
-        this.dispatchEvent(new Event('leadershipchange'));
-        this._postMessage(To.Others, 'onLeader', this._state);
+        // If leadership was relinquished during the callback, this tab never actively led: skip ready state, queued
+        // call dispatch, and the onLeader broadcast, which would pose this tab's stale state as fresh leader state.
+        if (!relinquished) {
+          this._isLeaderReady = true;
+          const queued = new Set(this._queuedCalls.keys());
+          this._queuedCalls.forEach(({ id, name, rest }, callNumber) => this._onCall(id, callNumber, name, ...rest));
+          this._queuedCalls.clear();
+          // Re-deliver this tab's own calls that were in flight to the previous
+          // leader when it died — we are the leader now, so dispatch them to
+          // ourselves (see the matching re-delivery for non-leader tabs in
+          // `_onLeader`; the same at-least-once caveat applies).
+          this._callDeferreds.forEach(({ name, rest }, callNumber) => {
+            if (queued.has(callNumber)) return;
+            this._clearSentCall(callNumber);
+            this._onCall(this._id, callNumber, name, ...rest);
+          });
+          this.dispatchEvent(new Event('leadershipchange'));
+          this._postMessage(To.Others, 'onLeader', this._state);
+        }
         return keepLockPromise;
       }).catch(e => e !== 'Aborted' && Promise.reject(e) || false);
     } finally {
       this._isLeader = false;
+      this._isLeaderReady = false;
       this._api = null;
       this.dispatchEvent(new Event('leadershipchange'));
     }
@@ -166,6 +181,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     return new Promise<R>(async (resolve, reject) => {
       const timeout = setTimeout(() => {
         this._callDeferreds.delete(callNumber);
+        this._queuedCalls.delete(callNumber);
         this._clearSentCall(callNumber);
         reject(new Error('Call timed out'));
       }, this._callTimeout);
@@ -209,6 +225,7 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
 
   close(): void {
     this.relinquishLeadership();
+    this._closeAbort.abort();
     this._isLeader = false;
     this._channel.close();
     this._channel.onmessage = null;
@@ -236,15 +253,15 @@ export class Tab<T = Record<string, any>> extends EventTarget implements Tab {
     const data = { to, name, rest };
     try {
       this._channel.postMessage(data);
-      if (this._isToMe(to, true)) {
-        this._onMessage(new MessageEvent('message', { data }));
-      }
     } catch (e) {
-      // If the channel is closed, create a new one and try again
-      if (e.name === 'InvalidStateError') {
-        this._createChannel();
-        this._postMessage(to, name, ...rest);
-      }
+      // Only a closed channel is recoverable: recreate it and retry once. Anything else (e.g. DataCloneError when a
+      // payload isn't structured-cloneable) must surface to the caller instead of silently dropping the message.
+      if (e.name !== 'InvalidStateError') throw e;
+      this._createChannel();
+      this._channel.postMessage(data);
+    }
+    if (this._isToMe(to, true)) {
+      this._onMessage(new MessageEvent('message', { data }));
     }
   }
 

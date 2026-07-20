@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { installLocksFake } from './locks-fake';
+import { installLocksFake, type LocksFake } from './locks-fake';
 import { Tab } from '../src/tab';
 
 /**
@@ -12,6 +12,7 @@ import { Tab } from '../src/tab';
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 let tabs: Tab[] = [];
+let locks: LocksFake;
 let names = 0;
 let name: string;
 
@@ -22,7 +23,7 @@ function makeTab(options?: { callTimeout?: number }): Tab {
 }
 
 beforeEach(() => {
-  installLocksFake();
+  locks = installLocksFake();
   name = `test-${++names}`;
 });
 
@@ -120,5 +121,74 @@ describe('Tab calls', () => {
     await wait(700); // > one resend interval
     monitor.close();
     expect(resends).toBe(0);
+  });
+});
+
+describe('Tab leadership lifecycle', () => {
+  it('does not broadcast onLeader when leadership is relinquished during the callback', async () => {
+    const monitor = new BroadcastChannel(`tab-${name}`);
+    let onLeaderPosts = 0;
+    monitor.onmessage = e => {
+      if (e.data?.name === 'onLeader') onLeaderPosts++;
+    };
+
+    const tab = makeTab();
+    await expect(tab.waitForLeadership(relinquish => relinquish())).resolves.toBe(true);
+    await wait(20);
+    monitor.close();
+    expect(onLeaderPosts).toBe(0);
+  });
+
+  it('queues calls that arrive while a re-elected leader is still initializing', async () => {
+    // Term 1 completes normally, then the same tab re-wins with a slow init;
+    // the ready flag from term 1 must not leak into term 2.
+    const tab = makeTab();
+    const term1 = tab.waitForLeadership(() => ({ svc: { work: async () => 'first' } }));
+    await wait(20);
+    tab.relinquishLeadership();
+    await term1;
+
+    let ready!: (api: any) => void;
+    void tab.waitForLeadership(() => new Promise(resolve => (ready = resolve)));
+    await wait(20);
+
+    const spoke = makeTab({ callTimeout: 1500 });
+    const pending = spoke.call('svc.work');
+    await wait(50);
+
+    ready({ svc: { work: async () => 'second' } });
+    await expect(pending).resolves.toBe('second');
+  });
+
+  it('drops a queued call once it times out instead of executing it on a later leader', async () => {
+    const spoke = makeTab({ callTimeout: 100 });
+    await expect(spoke.call('svc.work')).rejects.toThrow('Call timed out');
+
+    let executions = 0;
+    const leader = makeTab();
+    leader.waitForLeadership(() => ({ svc: { work: async () => executions++ } }));
+    await wait(50);
+    expect(executions).toBe(0);
+  });
+
+  it('cancels the has-leader watcher lock request on close', async () => {
+    const leader = makeTab();
+    leader.waitForLeadership(() => ({}));
+    await wait(20);
+
+    const spoke = makeTab();
+    await expect(spoke.hasLeader()).resolves.toBe(true);
+    expect(locks.pendingCount(`tab-${name}`)).toBe(1);
+
+    spoke.close();
+    expect(locks.pendingCount(`tab-${name}`)).toBe(0);
+  });
+
+  it('surfaces non-cloneable payload errors from setState instead of swallowing them', async () => {
+    const tab = makeTab();
+    tab.waitForLeadership(() => ({}));
+    await wait(20);
+
+    expect(() => tab.setState({ fn: () => {} } as any)).toThrow();
   });
 });

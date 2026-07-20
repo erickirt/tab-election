@@ -66,6 +66,11 @@ export class LocksFake {
     });
   }
 
+  /** Requests still waiting in the queue for `name` (the current holder excluded). */
+  pendingCount(name: string): number {
+    return this.queues.get(name)?.length ?? 0;
+  }
+
   private grant(name: string, waiter: Pick<Waiter, 'cb' | 'resolve' | 'reject'>): void {
     let abort!: (reason: unknown) => void;
     const aborted = new Promise((_, rej) => (abort = rej));
